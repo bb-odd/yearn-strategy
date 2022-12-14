@@ -8,6 +8,7 @@ pragma experimental ABIEncoderV2;
 // These are the core Yearn libraries
 import {BaseStrategy, StrategyParams} from "@yearnvaults/contracts/BaseStrategy.sol";
 import {SafeERC20, SafeMath, IERC20, Address} from "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/math/Math.sol";
 import "../interfaces/IEuler.sol";
 import "../interfaces/IEToken.sol";
 import "../interfaces/IDToken.sol";
@@ -24,9 +25,10 @@ contract Strategy is BaseStrategy {
 
     // used to determine what % of dai to borrow based on collat deposited on euler
     uint256 public borrowPercent = 20;
+    uint256 public daiDecimals = 10 ** 18;
 
-    IEtoken public eulerStaking;
-    IDtoken public eulerCollat;
+    IEToken public eulerStaking;
+    IDToken public eulerCollat;
     IEuler public eulerMarket;
     IUniSwap public uniswap;
     IVault public daiVault;
@@ -43,7 +45,7 @@ contract Strategy is BaseStrategy {
         _initialize(_vault, msg.sender, msg.sender, msg.sender);
 
         eulerMarket = IEuler(0x3520d5a913427E6F0D6A83E07ccD4A4da316e4d3);
-        eulerStaking = eulerMarket.underlyingToEToken(want);
+        eulerStaking = IEToken(eulerMarket.underlyingToEToken(address(want)));
 
         daiVault = IVault(0xdA816459F1AB5631232FE5e97a05BBBb94970c95);
 
@@ -65,8 +67,10 @@ contract Strategy is BaseStrategy {
     }
 
     function getStakedDai() public view returns (uint256) {
-        uint256 stakedDai = (daiVault.balanceOf(address(this)) *
-            daiVault.pricePerShare()) / daiVault.decimals;
+        uint256 pricePerShare = daiVault.pricePerShare();
+        uint256 shares = daiVault.balanceOf(address(this));
+
+        uint256 stakedDai = (shares * pricePerShare) / daiVault.decimals();
         return stakedDai;
     }
 
@@ -118,6 +122,7 @@ contract Strategy is BaseStrategy {
 
         // claim eul tokens here from borrowing
 
+        uint256 _liquidatedAmount;
         // handles realised profits
         if (totalAssets >= totalDebt) {
             _profit = totalAssets - totalDebt;
@@ -135,6 +140,7 @@ contract Strategy is BaseStrategy {
             }
         } else {
             // handles any realised losses (most likely none)
+            uint256 _extraLoss;
             uint256 percentageStakedToWithdraw = (totalAssets * 100).div(
                 Math.min(totalAssets, _debtOutstanding)
             );
@@ -162,8 +168,8 @@ contract Strategy is BaseStrategy {
             return;
         }
 
-        if (eulerCollat == address(0)) {
-            eulerCollat = IDToken(eulerMarket.underlyingToDToken(DAI));
+        if (address(eulerCollat) == address(0)) {
+            eulerCollat = IDToken(eulerMarket.underlyingToDToken(address(DAI)));
         }
 
         uint256 stakeAmount = (want.balanceOf(address(this))).sub(
@@ -213,14 +219,13 @@ contract Strategy is BaseStrategy {
         // repay dai collat into euler
         // then liquidate certain amount of `want` from euler
 
-        _loss = 0;
         uint256 stakedAssets = eulerStaking.balanceOfUnderlying(address(this));
         uint256 newDaiBorrow = ((stakedAssets - _amountNeeded) *
             borrowPercent) / 100;
 
         if (newDaiBorrow < getStakedDai()) {
             uint256 sharesToLiquidate = daiVault.balanceOf(address(this)) -
-                ((newDaiBorrow * DAI.decimals) / daiVault.pricePerShare());
+                ((newDaiBorrow * daiDecimals) / daiVault.pricePerShare());
 
             daiVault.withdraw(
                 Math.min(daiVault.maxAvailableShares(), sharesToLiquidate)
@@ -233,6 +238,7 @@ contract Strategy is BaseStrategy {
         eulerStaking.withdraw(0, _amountNeeded);
         uint256 newWantAvailable = want.balanceOf(address(this));
 
+        // we calculate loss here if we weren't able to withdraw enough `want` from euler (due to not enough dai available from dai vault)
         _liquidatedAmount = newWantAvailable - wantAvailable;
         if (_liquidatedAmount < _amountNeeded) {
             _loss = _amountNeeded - _liquidatedAmount;
@@ -300,19 +306,19 @@ contract Strategy is BaseStrategy {
         uint256 _amount
     ) public view returns (uint256) {
         require(_amount > 0, "Amount cannot be 0");
-        address[] path;
-        if (start == weth) {
+        address[] memory path;
+        if (_start == weth) {
             path = new address[](2);
             path[0] = weth;
-            path[1] = end;
+            path[1] = _end;
         } else {
             path = new address[](3);
-            path[0] = start;
+            path[0] = _start;
             path[1] = weth;
-            path[2] = end;
+            path[2] = _end;
         }
 
-        uint256[] amounts = uniswap.getAmountsOut(_amount, path);
+        uint256[] memory amounts = uniswap.getAmountsOut(_amount, path);
         return amounts[amounts.length - 1];
     }
 }

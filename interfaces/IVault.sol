@@ -7,6 +7,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 interface IVault is IERC20 {
     function name() external view returns (string calldata);
 
+    function decimals() external view returns (uint256);
+
     function deposit() external returns (uint256);
 
     function deposit(uint256 amount) external returns (uint256);

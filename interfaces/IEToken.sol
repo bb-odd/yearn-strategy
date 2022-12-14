@@ -2,7 +2,7 @@
 
 pragma solidity 0.6.12;
 
-interface IEtoken {
+interface IEToken {
     function deposit(uint subAccountId, uint amount) external;
 
     function withdraw(uint subAccountId, uint amount) external;

@@ -2,7 +2,7 @@
 
 pragma solidity 0.6.12;
 
-interface IDtoken {
+interface IDToken {
     function borrow(uint subAccountId, uint amount) external;
 
     function repay(uint subAccountId, uint amount) external;
