@@ -6,4 +6,8 @@ interface IEuler {
     function underlyingToEToken(
         address underlying
     ) external view returns (address);
+
+    function underlyingToDToken(
+        address underlying
+    ) external view returns (address);
 }

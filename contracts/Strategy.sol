@@ -10,7 +10,9 @@ import {BaseStrategy, StrategyParams} from "@yearnvaults/contracts/BaseStrategy.
 import {SafeERC20, SafeMath, IERC20, Address} from "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import "../interfaces/IEuler.sol";
 import "../interfaces/IEToken.sol";
+import "../interfaces/IDToken.sol";
 import "../interfaces/IUniswap.sol";
+import "../interfaces/IVault.sol";
 
 // Import interfaces for many popular DeFi projects, or add your own!
 //import "../interfaces/<protocol>/<Interface>.sol";
@@ -24,8 +26,12 @@ contract Strategy is BaseStrategy {
     uint256 public borrowPercent = 20;
 
     IEtoken public eulerStaking;
+    IDtoken public eulerCollat;
     IEuler public eulerMarket;
     IUniSwap public uniswap;
+    IVault public daiVault;
+    IERC20 public DAI = IERC20(0x6B175474E89094C44Da98b954EedeAC495271d0F);
+    address public weth = address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
 
     constructor(address _vault) public BaseStrategy(_vault) {
         // You can set these parameters on deployment to whatever you want
@@ -39,9 +45,17 @@ contract Strategy is BaseStrategy {
         eulerMarket = IEuler(0x3520d5a913427E6F0D6A83E07ccD4A4da316e4d3);
         eulerStaking = eulerMarket.underlyingToEToken(want);
 
-        // give Euler and uniswap unlimited access to want
-        want.safeApprove(address(eulerStaking), type(uint256).max);
-        want.safeApprove(address(uniswap), type(uint256).max);
+        daiVault = IVault(0xdA816459F1AB5631232FE5e97a05BBBb94970c95);
+
+        want.safeApprove(
+            address(0x27182842E098f60e3D576794A5bFFb0777E025d3),
+            type(uint256).max
+        );
+        DAI.safeApprove(
+            address(0x27182842E098f60e3D576794A5bFFb0777E025d3),
+            type(uint256).max
+        );
+        DAI.safeApprove(address(uniswap), type(uint256).max);
     }
 
     // ******** OVERRIDE THESE METHODS FROM BASE CONTRACT ************
@@ -50,10 +64,39 @@ contract Strategy is BaseStrategy {
         return "StrategyEulerUni";
     }
 
+    function getStakedDai() public view returns (uint256) {
+        uint256 stakedDai = (daiVault.balanceOf(address(this)) *
+            daiVault.pricePerShare()) / daiVault.decimals;
+        return stakedDai;
+    }
+
     function estimatedTotalAssets() public view override returns (uint256) {
+        uint256 stakedDai = getStakedDai();
+        uint256 borrowedDai = eulerCollat.balanceOf(address(this));
+
+        uint256 daiProfit = 0;
+        uint256 daiLoss = 0;
+        if (stakedDai >= borrowedDai) {
+            daiProfit = priceCheck(
+                address(DAI),
+                address(want),
+                stakedDai - borrowedDai
+            );
+        } else {
+            daiLoss = priceCheck(
+                address(DAI),
+                address(want),
+                borrowedDai - stakedDai
+            );
+        }
+        // add eul token value from borrowing here
+        // https://github.com/euler-xyz/eul-merkle-trees
+        uint256 totalAssets;
         uint256 stakedAssets = eulerStaking.balanceOfUnderlying(address(this));
         uint256 looseAssets = want.balanceOf(address(this));
-        return stakedAssets.add(looseAssets);
+        totalAssets = stakedAssets.add(looseAssets);
+        totalAssets = (totalAssets.add(daiProfit)).sub(daiLoss);
+        return totalAssets;
     }
 
     function prepareReturn(
@@ -72,6 +115,8 @@ contract Strategy is BaseStrategy {
 
         uint256 totalDebt = vault.strategies(address(this)).totalDebt;
         uint256 totalAssets = estimatedTotalAssets();
+
+        // claim eul tokens here from borrowing
 
         // handles realised profits
         if (totalAssets >= totalDebt) {
@@ -103,6 +148,7 @@ contract Strategy is BaseStrategy {
             }
             _loss = _loss.add(_extraLoss);
         }
+
         // use Math.min as strategy may not have enough want tokens to repay debt
         _debtPayment = Math.min(_debtOutstanding, _liquidatedAmount);
     }
@@ -116,11 +162,43 @@ contract Strategy is BaseStrategy {
             return;
         }
 
+        if (eulerCollat == address(0)) {
+            eulerCollat = IDToken(eulerMarket.underlyingToDToken(DAI));
+        }
+
         uint256 stakeAmount = (want.balanceOf(address(this))).sub(
             _debtOutstanding
         );
 
         eulerStaking.deposit(0, stakeAmount);
+
+        // this might be wrong but idk fix it later
+        uint256 maxCollat = eulerCollat.debtAllowance(
+            address(this),
+            address(this)
+        );
+
+        uint256 stakedDai = getStakedDai();
+        uint256 daiToBorrow = (maxCollat * borrowPercent) / 100;
+
+        if (stakedDai >= daiToBorrow) {
+            return;
+        }
+
+        daiToBorrow = daiToBorrow.sub(stakedDai);
+
+        if (daiVault.availableDepositLimit() == 0) {
+            return;
+        }
+
+        eulerCollat.borrow(
+            0,
+            Math.min(daiToBorrow, daiVault.availableDepositLimit())
+        );
+
+        daiVault.deposit(
+            Math.min(daiToBorrow, daiVault.availableDepositLimit())
+        );
     }
 
     function liquidatePosition(
@@ -129,6 +207,28 @@ contract Strategy is BaseStrategy {
         // TODO: Do stuff here to free up to `_amountNeeded` from all positions back into `want`
         // NOTE: Maintain invariant `want.balanceOf(this) >= _liquidatedAmount`
         // NOTE: Maintain invariant `_liquidatedAmount + _loss <= _amountNeeded`
+
+        // figure out updated daiToBorrow amount
+        // remove dai from vault daiStaked - newDaiToBorrow
+        // repay dai collat into euler
+        // then liquidate certain amount of `want` from euler
+
+        _loss = 0;
+        uint256 stakedAssets = eulerStaking.balanceOfUnderlying(address(this));
+        uint256 newDaiBorrow = ((stakedAssets - _amountNeeded) *
+            borrowPercent) / 100;
+
+        if (newDaiBorrow < getStakedDai()) {
+            uint256 sharesToLiquidate = daiVault.balanceOf(address(this)) -
+                ((newDaiBorrow * DAI.decimals) / daiVault.pricePerShare());
+
+            daiVault.withdraw(
+                Math.min(daiVault.maxAvailableShares(), sharesToLiquidate)
+            );
+        }
+
+        eulerCollat.repay(0, DAI.balanceOf(address(this)));
+
         uint256 wantAvailable = want.balanceOf(address(this));
         eulerStaking.withdraw(0, _amountNeeded);
         uint256 newWantAvailable = want.balanceOf(address(this));
@@ -190,5 +290,29 @@ contract Strategy is BaseStrategy {
     ) public view virtual override returns (uint256) {
         // TODO create an accurate price oracle
         return _amtInWei;
+    }
+
+    // uses uniswap router to check price
+    // used in the strategy to check price of dai -> uni so we can estimate total assets
+    function priceCheck(
+        address _start,
+        address _end,
+        uint256 _amount
+    ) public view returns (uint256) {
+        require(_amount > 0, "Amount cannot be 0");
+        address[] path;
+        if (start == weth) {
+            path = new address[](2);
+            path[0] = weth;
+            path[1] = end;
+        } else {
+            path = new address[](3);
+            path[0] = start;
+            path[1] = weth;
+            path[2] = end;
+        }
+
+        uint256[] amounts = uniswap.getAmountsOut(_amount, path);
+        return amounts[amounts.length - 1];
     }
 }
